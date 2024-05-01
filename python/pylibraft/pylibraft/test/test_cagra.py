@@ -122,16 +122,20 @@ def run_cagra_build_search_test(
 @pytest.mark.parametrize("dtype", [np.float32, np.int8, np.uint8])
 @pytest.mark.parametrize("array_type", ["device", "host"])
 @pytest.mark.parametrize("build_algo", ["ivf_pq", "nn_descent"])
+@pytest.mark.parametrize("metric", ["sqeuclidean", "inner_product"])
 def test_cagra_dataset_dtype_host_device(
-    dtype, array_type, inplace, build_algo
+    dtype, array_type, inplace, build_algo, metric
 ):
     # Note that inner_product tests use normalized input which we cannot
     # represent in int8, therefore we test only sqeuclidean metric here.
+    if metric == "inner_product" and (dtype != np.float32 or build_algo == "nn_descent"):
+        pytest.skip()
     run_cagra_build_search_test(
         dtype=dtype,
         inplace=inplace,
         array_type=array_type,
         build_algo=build_algo,
+        metric=metric,
     )
 
 
@@ -147,11 +151,19 @@ def test_cagra_dataset_dtype_host_device(
             "build_algo": "ivf_pq",
         },
         {
+            "intermediate_graph_degree": 64,
+            "graph_degree": 32,
+            "add_data_on_build": True,
+            "k": 10,
+            "metric": "inner_product",
+            "build_algo": "ivf_pq",
+        },
+        {
             "intermediate_graph_degree": 32,
             "graph_degree": 16,
             "add_data_on_build": False,
             "k": 5,
-            "metric": "sqeuclidean",
+            "metric": "inner_product",
             "build_algo": "ivf_pq",
         },
         {
