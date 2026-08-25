@@ -100,6 +100,39 @@ struct matmul_key_hash {
   }
 };
 
+/**
+ * cuBLASLt 13.6.0, shipped with CUDA 13.3, may select algorithm 68 once A's physical span reaches
+ * 2^31 elements. That algorithm fails during execution for FP32.
+ */
+inline auto needs_cublaslt_13_6_workaround(const matmul_key_t& args, std::size_t version) noexcept
+  -> bool
+{
+  constexpr uint64_t max_safe_span = (uint64_t{1} << 31) - 1;
+  const auto a_columns             = args.trans_a ? args.m : args.k;
+  return version == 130600 && args.lda != 0 && a_columns > max_safe_span / args.lda;
+}
+
+/**
+ * Querying with a physical A leading dimension that is not 16-byte aligned suppresses algorithm 68.
+ * The returned algorithm is then used with the real descriptors.
+ */
+inline auto get_cublaslt_13_6_heuristic_args(const matmul_key_t& args) noexcept -> matmul_key_t
+{
+  constexpr uint64_t fp32_elements_per_16_bytes = 4;
+  auto heuristic_args                           = args;
+  if (heuristic_args.lda % fp32_elements_per_16_bytes == 0) { ++heuristic_args.lda; }
+  return heuristic_args;
+}
+
+inline auto get_cublaslt_algorithm_id(const cublasLtMatmulHeuristicResult_t& heuristic) -> int
+{
+  int algorithm_id{};
+  std::size_t bytes_written{};
+  RAFT_CUBLAS_TRY(cublasLtMatmulAlgoConfigGetAttribute(
+    &heuristic.algo, CUBLASLT_ALGO_CONFIG_ID, &algorithm_id, sizeof(algorithm_id), &bytes_written));
+  return algorithm_id;
+}
+
 /** Descriptor for a column-major cublasLt matrix. */
 struct cublastlt_matrix_layout {
   cublasLtMatrixLayout_t res{nullptr};
@@ -134,6 +167,23 @@ struct cublastlt_matrix_layout {
     return cublastlt_matrix_layout{
       get_cuda_data_type<T>(), col_major ? rows : cols, col_major ? cols : rows, ld};
   }
+
+  template <typename T>
+  static inline auto for_strided_batched_matmul(bool col_major,
+                                                uint64_t rows,
+                                                uint64_t cols,
+                                                uint64_t ld,
+                                                int32_t batch_count,
+                                                int64_t batch_stride) -> cublastlt_matrix_layout
+  {
+    RAFT_EXPECTS(batch_count > 0, "cuBLASLt batch count must be positive");
+    auto layout = for_matmul<T>(col_major, rows, cols, ld);
+    RAFT_CUBLAS_TRY(cublasLtMatrixLayoutSetAttribute(
+      layout, CUBLASLT_MATRIX_LAYOUT_BATCH_COUNT, &batch_count, sizeof(batch_count)));
+    RAFT_CUBLAS_TRY(cublasLtMatrixLayoutSetAttribute(
+      layout, CUBLASLT_MATRIX_LAYOUT_STRIDED_BATCH_OFFSET, &batch_stride, sizeof(batch_stride)));
+    return layout;
+  }
 };
 
 /** Descriptor for a cublasLt matmul function. */
@@ -164,9 +214,12 @@ struct cublastlt_matmul_desc {
   inline operator cublasLtMatmulDesc_t() const noexcept { return res; }
 
   template <typename S, typename A, typename B, typename C, bool DevicePointerMode = false>
-  static inline auto for_matmul(bool transpose_a, bool transpose_b) -> cublastlt_matmul_desc
+  static inline auto for_matmul(bool transpose_a,
+                                bool transpose_b,
+                                cublasComputeType_t compute_type = get_matmul_type<S, A, B, C>())
+    -> cublastlt_matmul_desc
   {
-    auto desc = cublastlt_matmul_desc{get_matmul_type<S, A, B, C>(), get_cuda_data_type<S>()};
+    auto desc = cublastlt_matmul_desc{compute_type, get_cuda_data_type<S>()};
     if constexpr (DevicePointerMode) {
       const cublasPointerMode_t mode = CUBLAS_POINTER_MODE_DEVICE;
       RAFT_CUBLAS_TRY(cublasLtMatmulDescSetAttribute(
@@ -185,6 +238,24 @@ struct cublastlt_matmul_desc {
   }
 };
 
+/** Preference descriptor for a cublasLt matmul heuristic query. */
+struct cublastlt_matmul_preference {
+  cublasLtMatmulPreference_t res{nullptr};
+
+  inline cublastlt_matmul_preference() { RAFT_CUBLAS_TRY(cublasLtMatmulPreferenceCreate(&res)); }
+  inline cublastlt_matmul_preference(const cublastlt_matmul_preference&) = delete;
+  inline auto operator=(const cublastlt_matmul_preference&)
+    -> cublastlt_matmul_preference& = delete;
+
+  inline ~cublastlt_matmul_preference() noexcept
+  {
+    RAFT_CUBLAS_TRY_NO_THROW(cublasLtMatmulPreferenceDestroy(res));
+  }
+
+  // NOLINTNEXTLINE
+  inline operator cublasLtMatmulPreference_t() const noexcept { return res; }
+};
+
 /** Full description of matmul. */
 struct matmul_desc {
   cublastlt_matmul_desc desc;
@@ -201,20 +272,44 @@ struct matmul_desc {
       cublastlt_matrix_layout::for_matmul<A>(!(args.trans_a), args.m, args.k, args.lda),
       cublastlt_matrix_layout::for_matmul<B>(!(args.trans_b), args.k, args.n, args.ldb),
       cublastlt_matrix_layout::for_matmul<C>(true, args.m, args.n, args.ldc)};
+
+    bool use_cublaslt_13_6_workaround = false;
+    if constexpr (std::is_same_v<S, float> && std::is_same_v<A, float> &&
+                  std::is_same_v<B, float> && std::is_same_v<C, float>) {
+      use_cublaslt_13_6_workaround = needs_cublaslt_13_6_workaround(args, cublasLtGetVersion());
+    }
+
     int algo_count;
-    cublasLtMatmulPreference_t preference;
-    RAFT_CUBLAS_TRY(cublasLtMatmulPreferenceCreate(&preference));
-    RAFT_CUBLAS_TRY(cublasLtMatmulAlgoGetHeuristic(resource::get_cublaslt_handle(res),
-                                                   r.desc,
-                                                   r.a,
-                                                   r.b,
-                                                   r.c,
-                                                   r.c,
-                                                   preference,
-                                                   1,
-                                                   &r.heuristics,
-                                                   &algo_count));
-    RAFT_CUBLAS_TRY(cublasLtMatmulPreferenceDestroy(preference));
+    cublastlt_matmul_preference preference;
+    const auto query_heuristic = [&](cublasLtMatrixLayout_t a_layout,
+                                     cublasLtMatrixLayout_t c_layout) {
+      RAFT_CUBLAS_TRY(cublasLtMatmulAlgoGetHeuristic(resource::get_cublaslt_handle(res),
+                                                     r.desc,
+                                                     a_layout,
+                                                     r.b,
+                                                     c_layout,
+                                                     c_layout,
+                                                     preference,
+                                                     1,
+                                                     &r.heuristics,
+                                                     &algo_count));
+    };
+
+    if (use_cublaslt_13_6_workaround) {
+      const auto heuristic_args = get_cublaslt_13_6_heuristic_args(args);
+      const auto heuristic_a    = cublastlt_matrix_layout::for_matmul<A>(
+        !(heuristic_args.trans_a), heuristic_args.m, heuristic_args.k, heuristic_args.lda);
+      query_heuristic(heuristic_a, r.c);
+    } else {
+      query_heuristic(r.a, r.c);
+    }
+
+    RAFT_EXPECTS(algo_count > 0, "cuBLASLt did not return a matmul algorithm");
+    constexpr int faulty_algorithm = 68;
+    if (use_cublaslt_13_6_workaround) {
+      RAFT_EXPECTS(get_cublaslt_algorithm_id(r.heuristics) != faulty_algorithm,
+                   "cuBLASLt 13.6.0 returned faulty algorithm 68 for the workaround query");
+    }
     return r;
   }
 };
@@ -272,6 +367,70 @@ struct coef_wrapper<true, S> {
     if (store != nullptr) { RAFT_CUDA_TRY_NO_THROW(cudaFreeAsync(store, stream)); }
   }
 };
+
+/**
+ * Run a strided-batched cublasLt matmul without an algorithm or workspace preference.
+ *
+ * The matrix dimensions and leading dimensions follow the same column-major convention as
+ * `matmul`. Batch strides are measured in elements.
+ */
+template <bool DevicePointerMode = false, typename S, typename A, typename B, typename C>
+void matmul_strided_batched(raft::resources const& res,
+                            bool trans_a,
+                            bool trans_b,
+                            uint64_t m,
+                            uint64_t n,
+                            uint64_t k,
+                            const S* alpha,
+                            const A* a_ptr,
+                            uint64_t lda,
+                            int64_t stride_a,
+                            const B* b_ptr,
+                            uint64_t ldb,
+                            int64_t stride_b,
+                            const S* beta,
+                            C* c_ptr,
+                            uint64_t ldc,
+                            int64_t stride_c,
+                            int32_t batch_count,
+                            cublasComputeType_t compute_type)
+{
+  common::nvtx::range<common::nvtx::domain::raft> batch_scope(
+    "linalg::detail::matmul_strided_batched(m = %d, n = %d, k = %d, batch_count = %d)",
+    m,
+    n,
+    k,
+    batch_count);
+
+  auto operation = cublastlt_matmul_desc::for_matmul<S, A, B, C, DevicePointerMode>(
+    trans_a, trans_b, compute_type);
+
+  auto a_layout = cublastlt_matrix_layout::for_strided_batched_matmul<A>(
+    !trans_a, m, k, lda, batch_count, stride_a);
+  auto b_layout = cublastlt_matrix_layout::for_strided_batched_matmul<B>(
+    !trans_b, k, n, ldb, batch_count, stride_b);
+  auto c_layout =
+    cublastlt_matrix_layout::for_strided_batched_matmul<C>(true, m, n, ldc, batch_count, stride_c);
+
+  auto stream = resource::get_cuda_stream(res);
+  coef_wrapper<DevicePointerMode, S> coefficients(alpha, beta, stream);
+  RAFT_CUBLAS_TRY(cublasLtMatmul(resource::get_cublaslt_handle(res),
+                                 operation,
+                                 coefficients.alpha,
+                                 a_ptr,
+                                 a_layout,
+                                 b_ptr,
+                                 b_layout,
+                                 coefficients.beta,
+                                 c_ptr,
+                                 c_layout,
+                                 c_ptr,
+                                 c_layout,
+                                 nullptr,
+                                 nullptr,
+                                 0,
+                                 stream));
+}
 
 /**
  * Compatibility version of the cublasLt matmul wrapper: It takes the cudaStream_t argument
